@@ -1,6 +1,10 @@
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 using MailClient.API.Hubs;
 using MailClient.API.Models;
+using MailKit;
+using MailKit.Net.Imap;
+using MailKit.Search;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
@@ -10,105 +14,188 @@ namespace MailClient.API.Services;
 public class MailMonitorService : BackgroundService
 {
     private readonly ILogger<MailMonitorService> _logger;
-    private readonly IServiceScopeFactory _scopeFactory;
     private readonly IHubContext<MailHub> _hubContext;
     private readonly MailSettings _mailSettings;
-    private readonly ConcurrentDictionary<string, HashSet<string>> _knownEmailIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _knownEmailIds = new(StringComparer.OrdinalIgnoreCase);
 
-    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(10);
 
     public MailMonitorService(
         ILogger<MailMonitorService> logger,
-        IServiceScopeFactory scopeFactory,
         IHubContext<MailHub> hubContext,
         IOptions<MailSettings> mailSettings)
     {
         _logger = logger;
-        _scopeFactory = scopeFactory;
         _hubContext = hubContext;
         _mailSettings = mailSettings.Value;
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (_mailSettings.Accounts.Count == 0)
         {
             _logger.LogWarning("No mail accounts configured. Mail monitor will not run.");
-            return;
+            return Task.CompletedTask;
         }
 
         _logger.LogInformation("Mail monitor started for {Count} account(s).", _mailSettings.Accounts.Count);
 
-        while (!stoppingToken.IsCancellationRequested)
+        var monitorTasks = _mailSettings.Accounts
+            .Select(account => MonitorAccountAsync(account, stoppingToken))
+            .ToArray();
+
+        return Task.WhenAll(monitorTasks);
+    }
+
+    private async Task MonitorAccountAsync(MailAccount account, CancellationToken cancellationToken)
+    {
+        var knownIds = _knownEmailIds.GetOrAdd(account.Email, _ => new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase));
+
+        while (!cancellationToken.IsCancellationRequested)
         {
+            using var client = new ImapClient();
             try
             {
-                foreach (var account in _mailSettings.Accounts)
+                _logger.LogInformation("Connecting IMAP IDLE for account {Email}", account.Email);
+
+                await client.ConnectAsync(account.ImapServer, account.ImapPort, account.UseSsl, cancellationToken);
+                await client.AuthenticateAsync(account.Email, account.Password, cancellationToken);
+
+                var inbox = client.Inbox;
+                await inbox.OpenAsync(FolderAccess.ReadOnly, cancellationToken);
+
+                // Seed known messages to avoid notifying existing items
+                if (knownIds.IsEmpty)
                 {
-                    await CheckAccountAsync(account, stoppingToken);
+                    var existingUids = await inbox.SearchAsync(SearchQuery.All, cancellationToken);
+                    foreach (var uid in existingUids.TakeLast(50))
+                    {
+                        knownIds.TryAdd(uid.ToString(), 0);
+                    }
+
+                    if (existingUids.Count > 0)
+                    {
+                        _logger.LogInformation("Seeded {Count} existing emails for account {Email}", Math.Min(existingUids.Count, 50), account.Email);
+                    }
+                }
+
+                var pending = Channel.CreateUnbounded<UniqueId>();
+                CancellationTokenSource? idleCts = null;
+
+                void OnMessageArrived(object? sender, MessageEventArgs args)
+                {
+                    if (args.UniqueId.HasValue)
+                    {
+                        pending.Writer.TryWrite(args.UniqueId.Value);
+                    }
+
+                    idleCts?.Cancel();
+                }
+
+                inbox.MessageArrived += OnMessageArrived;
+
+                try
+                {
+                    var processorTask = Task.Run(async () =>
+                    {
+                        await foreach (var uniqueId in pending.Reader.ReadAllAsync(cancellationToken))
+                        {
+                            await ProcessMessageAsync(inbox, account.Email, uniqueId, knownIds, cancellationToken);
+                        }
+                    }, cancellationToken);
+
+                    while (!cancellationToken.IsCancellationRequested && client.IsConnected)
+                    {
+                        idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        idleCts.CancelAfter(TimeSpan.FromMinutes(9));
+
+                        try
+                        {
+                            await inbox.IdleAsync(idleCts.Token);
+                        }
+                        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                        {
+                            // Expected when a message arrives or when the keep-alive timer fires
+                        }
+                        finally
+                        {
+                            idleCts.Dispose();
+                            idleCts = null;
+                        }
+
+                        if (!client.IsConnected)
+                        {
+                            break;
+                        }
+
+                        await inbox.CheckAsync(cancellationToken);
+                    }
+
+                    pending.Writer.TryComplete();
+                    await processorTask;
+                }
+                finally
+                {
+                    inbox.MessageArrived -= OnMessageArrived;
+                }
+
+                if (client.IsConnected)
+                {
+                    await client.DisconnectAsync(true, cancellationToken);
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                // Normal shutdown, rethrow to exit loop
-                throw;
+                _logger.LogInformation("Stopping IMAP monitor for account {Email}", account.Email);
+                break;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Unexpected error while monitoring mail accounts.");
-            }
+                _logger.LogError(ex, "IMAP monitor error for account {Email}. Reconnecting...", account.Email);
 
-            try
-            {
-                await Task.Delay(PollInterval, stoppingToken);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
+                try
+                {
+                    await client.DisconnectAsync(true, cancellationToken);
+                }
+                catch
+                {
+                    // Ignore disconnect errors
+                }
+
+                try
+                {
+                    await Task.Delay(ReconnectDelay, cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
             }
         }
-
-        _logger.LogInformation("Mail monitor stopped.");
     }
 
-    private async Task CheckAccountAsync(MailAccount account, CancellationToken cancellationToken)
+    private async Task ProcessMessageAsync(IMailFolder inbox, string accountEmail, UniqueId uid, ConcurrentDictionary<string, byte> knownIds, CancellationToken cancellationToken)
     {
-        using var scope = _scopeFactory.CreateScope();
-        var mailService = scope.ServiceProvider.GetRequiredService<IMailService>();
+        var idString = uid.ToString();
+        if (!knownIds.TryAdd(idString, 0))
+        {
+            return;
+        }
 
-        List<EmailMessage> emails;
+        MimeMessage? message = null;
         try
         {
-            emails = await mailService.GetInboxEmailsAsync(account.Email);
+            message = await inbox.GetMessageAsync(uid, cancellationToken);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to pull emails for account {Email}", account.Email);
+            _logger.LogWarning(ex, "Failed to fetch new email {Uid} for {Email}", uid, accountEmail);
+            knownIds.TryRemove(idString, out _);
             return;
         }
 
-        if (emails.Count == 0)
-        {
-            _knownEmailIds.TryAdd(account.Email, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
-            return;
-        }
-
-        var knownIds = _knownEmailIds.GetOrAdd(account.Email, _ => new HashSet<string>(StringComparer.OrdinalIgnoreCase));
-        var isInitialization = knownIds.Count == 0;
-
-        foreach (var email in emails.OrderBy(e => e.Date))
-        {
-            if (!knownIds.Add(email.Id))
-                continue;
-
-            if (isInitialization)
-            {
-                // Seed existing emails without notifying clients
-                continue;
-            }
-
-            await NotifyNewEmailAsync(account.Email, email, cancellationToken);
-        }
+        var email = EmailMapper.ToEmailMessage(message, idString);
+        await NotifyNewEmailAsync(accountEmail, email, cancellationToken);
     }
 
     private async Task NotifyNewEmailAsync(string accountEmail, EmailMessage email, CancellationToken cancellationToken)
@@ -124,5 +211,4 @@ public class MailMonitorService : BackgroundService
         await _hubContext.Clients.Group(accountEmail).SendAsync("NewEmail", payload, cancellationToken);
     }
 }
-
 
