@@ -4,31 +4,22 @@ using MailKit.Net.Smtp;
 using MailKit.Search;
 using MimeKit;
 using MailClient.API.Models;
+using Microsoft.Extensions.Options;
 
 namespace MailClient.API.Services;
 
 public class MailService : IMailService
 {
-    // Tạm thời lưu thông tin kết nối trong mảng
-    private static readonly MailAccount[] MailAccounts = new[]
+    private readonly MailSettings _settings;
+
+    public MailService(IOptions<MailSettings> settings)
     {
-        // Ví dụ với Gmail
-        new MailAccount
-        {
-            Email = "your-email@gmail.com",
-            Password = "your-app-password", // Sử dụng App Password cho Gmail
-            ImapServer = "imap.gmail.com",
-            ImapPort = 993,
-            SmtpServer = "smtp.gmail.com",
-            SmtpPort = 587,
-            UseSsl = true
-        }
-        // Có thể thêm nhiều account khác vào đây
-    };
+        _settings = settings.Value;
+    }
 
     private MailAccount? GetAccount(string email)
     {
-        return MailAccounts.FirstOrDefault(a => a.Email.Equals(email, StringComparison.OrdinalIgnoreCase));
+        return _settings.Accounts.FirstOrDefault(a => a.Email.Equals(email, StringComparison.OrdinalIgnoreCase));
     }
 
     public async Task<List<EmailMessage>> GetInboxEmailsAsync(string accountEmail)
@@ -50,7 +41,7 @@ public class MailService : IMailService
 
             // Lấy 50 email mới nhất
             var uids = await inbox.SearchAsync(SearchQuery.All);
-            var items = uids.Take(50).ToList();
+            var items = uids.TakeLast(50).ToList();
 
             foreach (var uid in items)
             {
@@ -184,4 +175,5 @@ public class MailService : IMailService
         return emailMessage;
     }
 }
+
 

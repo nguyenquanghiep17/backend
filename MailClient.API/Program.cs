@@ -1,5 +1,6 @@
 using MailClient.API.Services;
 using MailClient.API.Models;
+using MailClient.API.Hubs;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -7,6 +8,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+builder.Services.AddSignalR();
 
 // Add CORS
 builder.Services.AddCors(options =>
@@ -21,7 +23,9 @@ builder.Services.AddCors(options =>
 });
 
 // Register mail service
+builder.Services.Configure<MailSettings>(builder.Configuration.GetSection("MailSettings"));
 builder.Services.AddScoped<IMailService, MailService>();
+builder.Services.AddHostedService<MailMonitorService>();
 
 var app = builder.Build();
 
@@ -32,9 +36,12 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
+app.UseRouting();
 app.UseCors("AllowVueApp");
 app.UseAuthorization();
 app.MapControllers();
+app.MapHub<MailHub>("/hub/mail");
 
 app.Run();
+
 

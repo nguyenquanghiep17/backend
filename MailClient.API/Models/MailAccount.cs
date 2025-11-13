@@ -11,3 +11,4 @@ public class MailAccount
     public bool UseSsl { get; set; } = true;
 }
 
+
