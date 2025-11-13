@@ -79,31 +79,18 @@ public class MailMonitorService : BackgroundService
                     }
                 }
 
-                var pending = Channel.CreateUnbounded<UniqueId>();
                 CancellationTokenSource? idleCts = null;
 
-                void OnMessageArrived(object? sender, MessageEventArgs args)
+                void OnCountChanged(object? sender, EventArgs args)
                 {
-                    if (args.UniqueId.HasValue)
-                    {
-                        pending.Writer.TryWrite(args.UniqueId.Value);
-                    }
-
+                    // Wake the IDLE loop; we'll query for new UIDs afterwards
                     idleCts?.Cancel();
                 }
 
-                inbox.MessageArrived += OnMessageArrived;
+                inbox.CountChanged += OnCountChanged;
 
                 try
                 {
-                    var processorTask = Task.Run(async () =>
-                    {
-                        await foreach (var uniqueId in pending.Reader.ReadAllAsync(cancellationToken))
-                        {
-                            await ProcessMessageAsync(inbox, account.Email, uniqueId, knownIds, cancellationToken);
-                        }
-                    }, cancellationToken);
-
                     while (!cancellationToken.IsCancellationRequested && client.IsConnected)
                     {
                         idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -129,14 +116,22 @@ public class MailMonitorService : BackgroundService
                         }
 
                         await inbox.CheckAsync(cancellationToken);
-                    }
 
-                    pending.Writer.TryComplete();
-                    await processorTask;
+                        // After IDLE breaks, look for newly appeared UIDs and process them
+                        var allUids = await inbox.SearchAsync(SearchQuery.All, cancellationToken);
+                        foreach (var uid in allUids.TakeLast(10)) // only scan a small tail
+                        {
+                            var idString = uid.ToString();
+                            if (!knownIds.TryAdd(idString, 0))
+                                continue;
+
+                            await ProcessMessageAsync(inbox, account.Email, uid, knownIds, cancellationToken);
+                        }
+                    }
                 }
                 finally
                 {
-                    inbox.MessageArrived -= OnMessageArrived;
+                    inbox.CountChanged -= OnCountChanged;
                 }
 
                 if (client.IsConnected)
