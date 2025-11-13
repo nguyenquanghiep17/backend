@@ -79,12 +79,12 @@ public class MailMonitorService : BackgroundService
                     }
                 }
 
-                CancellationTokenSource? idleCts = null;
+                CancellationTokenSource? idleDone = null;
 
                 void OnCountChanged(object? sender, EventArgs args)
                 {
                     // Wake the IDLE loop; we'll query for new UIDs afterwards
-                    idleCts?.Cancel();
+                    idleDone?.Cancel();
                 }
 
                 inbox.CountChanged += OnCountChanged;
@@ -93,12 +93,12 @@ public class MailMonitorService : BackgroundService
                 {
                     while (!cancellationToken.IsCancellationRequested && client.IsConnected)
                     {
-                        idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                        idleCts.CancelAfter(TimeSpan.FromMinutes(9));
+                        idleDone = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        idleDone.CancelAfter(TimeSpan.FromMinutes(9));
 
                         try
                         {
-                            await inbox.IdleAsync(idleCts.Token);
+                            await client.IdleAsync(idleDone.Token, cancellationToken);
                         }
                         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
                         {
@@ -106,8 +106,8 @@ public class MailMonitorService : BackgroundService
                         }
                         finally
                         {
-                            idleCts.Dispose();
-                            idleCts = null;
+                            idleDone.Dispose();
+                            idleDone = null;
                         }
 
                         if (!client.IsConnected)
