@@ -1,13 +1,9 @@
 using System.Collections.Concurrent;
-using System.Threading.Channels;
 using MailClient.API.Hubs;
 using MailClient.API.Models;
-using MailKit;
-using MailKit.Net.Imap;
-using MailKit.Search;
+using MailClient.API.Abstractions;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Options;
 
 namespace MailClient.API.Services;
 
@@ -15,36 +11,110 @@ public class MailMonitorService : BackgroundService
 {
     private readonly ILogger<MailMonitorService> _logger;
     private readonly IHubContext<MailHub> _hubContext;
-    private readonly MailSettings _mailSettings;
+    private readonly IDistributedAccountAllocator _allocator;
+    private readonly IMailClientFactory _mailClientFactory;
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _knownEmailIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Task> _monitorTasks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _accountCancellationTokens = new(StringComparer.OrdinalIgnoreCase);
 
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan RefreshInterval = TimeSpan.FromMinutes(5); // Refresh allocation every 5 minutes
 
     public MailMonitorService(
         ILogger<MailMonitorService> logger,
         IHubContext<MailHub> hubContext,
-        IOptions<MailSettings> mailSettings)
+        IDistributedAccountAllocator allocator,
+        IMailClientFactory mailClientFactory)
     {
         _logger = logger;
         _hubContext = hubContext;
-        _mailSettings = mailSettings.Value;
+        _allocator = allocator;
+        _mailClientFactory = mailClientFactory;
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (_mailSettings.Accounts.Count == 0)
+        _logger.LogInformation("Mail monitor started. Pod: {PodId}", _allocator.GetPodIdentifier());
+
+        // Initial load
+        await RefreshAndStartMonitorsAsync(stoppingToken);
+
+        // Periodically refresh allocation to handle pod scaling
+        while (!stoppingToken.IsCancellationRequested)
         {
-            _logger.LogWarning("No mail accounts configured. Mail monitor will not run.");
-            return Task.CompletedTask;
+            try
+            {
+                await Task.Delay(RefreshInterval, stoppingToken);
+                await RefreshAndStartMonitorsAsync(stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during allocation refresh");
+            }
         }
 
-        _logger.LogInformation("Mail monitor started for {Count} account(s).", _mailSettings.Accounts.Count);
+        // Stop all monitors
+        foreach (var cts in _accountCancellationTokens.Values)
+        {
+            cts.Cancel();
+        }
 
-        var monitorTasks = _mailSettings.Accounts
-            .Select(account => MonitorAccountAsync(account, stoppingToken))
-            .ToArray();
+        await Task.WhenAll(_monitorTasks.Values);
+    }
 
-        return Task.WhenAll(monitorTasks);
+    private async Task RefreshAndStartMonitorsAsync(CancellationToken stoppingToken)
+    {
+        var allocatedAccounts = await _allocator.GetAllocatedAccountsAsync(stoppingToken);
+
+        if (allocatedAccounts.Count == 0)
+        {
+            _logger.LogWarning("No mail accounts allocated to this pod. Pod: {PodId}", _allocator.GetPodIdentifier());
+            return;
+        }
+
+        _logger.LogInformation("Refreshing allocation. Pod: {PodId}, Allocated accounts: {Count}", 
+            _allocator.GetPodIdentifier(), allocatedAccounts.Count);
+
+        var currentAccountEmails = new HashSet<string>(
+            allocatedAccounts.Select(a => a.Email), 
+            StringComparer.OrdinalIgnoreCase);
+
+        // Stop monitors for accounts no longer allocated to this pod
+        var accountsToStop = _monitorTasks.Keys
+            .Where(email => !currentAccountEmails.Contains(email))
+            .ToList();
+
+        foreach (var email in accountsToStop)
+        {
+            _logger.LogInformation("Stopping monitor for account {Email} (no longer allocated)", email);
+            if (_accountCancellationTokens.TryRemove(email, out var cts))
+            {
+                cts.Cancel();
+            }
+            _monitorTasks.TryRemove(email, out _);
+        }
+
+        // Start/restart monitors for allocated accounts
+        foreach (var account in allocatedAccounts)
+        {
+            if (_monitorTasks.ContainsKey(account.Email))
+            {
+                // Already monitoring, skip
+                continue;
+            }
+
+            var accountCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            _accountCancellationTokens[account.Email] = accountCts;
+
+            var monitorTask = MonitorAccountAsync(account, accountCts.Token);
+            _monitorTasks[account.Email] = monitorTask;
+
+            _logger.LogInformation("Started monitor for account {Email}", account.Email);
+        }
     }
 
     private async Task MonitorAccountAsync(MailAccount account, CancellationToken cancellationToken)
@@ -53,7 +123,7 @@ public class MailMonitorService : BackgroundService
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            using var client = new ImapClient();
+            using var client = _mailClientFactory.CreateClient();
             try
             {
                 _logger.LogInformation("Connecting IMAP IDLE for account {Email}", account.Email);
@@ -61,16 +131,16 @@ public class MailMonitorService : BackgroundService
                 await client.ConnectAsync(account.ImapServer, account.ImapPort, account.UseSsl, cancellationToken);
                 await client.AuthenticateAsync(account.Email, account.Password, cancellationToken);
 
-                var inbox = client.Inbox;
+                var inbox = await client.GetInboxAsync();
                 await inbox.OpenAsync(FolderAccess.ReadOnly, cancellationToken);
 
                 // Seed known messages to avoid notifying existing items
                 if (knownIds.IsEmpty)
                 {
-                    var existingUids = await inbox.SearchAsync(SearchQuery.All, cancellationToken);
+                    var existingUids = await inbox.SearchAllAsync(cancellationToken);
                     foreach (var uid in existingUids.TakeLast(50))
                     {
-                        knownIds.TryAdd(uid.ToString(), 0);
+                        knownIds.TryAdd(uid, 0);
                     }
 
                     if (existingUids.Count > 0)
@@ -98,7 +168,7 @@ public class MailMonitorService : BackgroundService
 
                         try
                         {
-                            await client.IdleAsync(idleDone.Token, cancellationToken);
+                            await client.IdleAsync(idleDone.Token);
                         }
                         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
                         {
@@ -118,11 +188,10 @@ public class MailMonitorService : BackgroundService
                         await inbox.CheckAsync(cancellationToken);
 
                         // After IDLE breaks, look for newly appeared UIDs and process them
-                        var allUids = await inbox.SearchAsync(SearchQuery.All, cancellationToken);
+                        var allUids = await inbox.SearchAllAsync(cancellationToken);
                         foreach (var uid in allUids.TakeLast(10)) // only scan a small tail
                         {
-                            var idString = uid.ToString();
-                            if (!knownIds.TryAdd(idString, 0))
+                            if (!knownIds.TryAdd(uid, 0))
                                 continue;
 
                             await ProcessMessageAsync(inbox, account.Email, uid, knownIds, cancellationToken);
@@ -150,7 +219,10 @@ public class MailMonitorService : BackgroundService
 
                 try
                 {
-                    await client.DisconnectAsync(true, cancellationToken);
+                    if (client.IsConnected)
+                    {
+                        await client.DisconnectAsync(true, cancellationToken);
+                    }
                 }
                 catch
                 {
@@ -169,27 +241,26 @@ public class MailMonitorService : BackgroundService
         }
     }
 
-    private async Task ProcessMessageAsync(IMailFolder inbox, string accountEmail, UniqueId uid, ConcurrentDictionary<string, byte> knownIds, CancellationToken cancellationToken)
+    private async Task ProcessMessageAsync(IMailFolder inbox, string accountEmail, string uid, ConcurrentDictionary<string, byte> knownIds, CancellationToken cancellationToken)
     {
-        var idString = uid.ToString();
-        if (!knownIds.TryAdd(idString, 0))
+        // Note: knownIds.TryAdd was already called in the caller, this is just a safety check
+        if (!knownIds.ContainsKey(uid))
         {
-            return;
+            knownIds.TryAdd(uid, 0);
         }
 
-        MimeMessage? message = null;
+        EmailMessage? email = null;
         try
         {
-            message = await inbox.GetMessageAsync(uid, cancellationToken);
+            email = await inbox.GetMessageAsync(uid, cancellationToken);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to fetch new email {Uid} for {Email}", uid, accountEmail);
-            knownIds.TryRemove(idString, out _);
+            knownIds.TryRemove(uid, out _);
             return;
         }
 
-        var email = EmailMapper.ToEmailMessage(message, idString);
         await NotifyNewEmailAsync(accountEmail, email, cancellationToken);
     }
 

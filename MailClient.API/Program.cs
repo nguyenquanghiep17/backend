@@ -1,6 +1,8 @@
 using MailClient.API.Services;
 using MailClient.API.Models;
 using MailClient.API.Hubs;
+using MailClient.API.Implementations.MailKit;
+using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -22,8 +24,18 @@ builder.Services.AddCors(options =>
     });
 });
 
-// Register mail service
-builder.Services.Configure<MailSettings>(builder.Configuration.GetSection("MailSettings"));
+// Register MySQL connections (for reference, actual connections are created in repository)
+// Note: Connection strings are hardcoded in MailAccountRepository for now
+// In production, these should come from configuration or environment variables
+
+// Register mail services
+builder.Services.AddScoped<IMailAccountRepository, MailAccountRepository>();
+builder.Services.AddSingleton<IDistributedAccountAllocator, DistributedAccountAllocator>();
+
+// Register mail client factory (abstraction layer)
+// To swap mail library, just change this registration
+builder.Services.AddSingleton<IMailClientFactory, MailKitMailClientFactory>();
+
 builder.Services.AddScoped<IMailService, MailService>();
 builder.Services.AddHostedService<MailMonitorService>();
 

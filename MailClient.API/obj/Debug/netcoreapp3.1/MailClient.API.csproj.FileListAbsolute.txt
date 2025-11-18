@@ -1,0 +1,8 @@
+C:\Mail\backend\MailClient.API\obj\Debug\netcoreapp3.1\MailClient.API.csproj.AssemblyReference.cache
+C:\Mail\backend\MailClient.API\obj\Debug\netcoreapp3.1\MailClient.API.GeneratedMSBuildEditorConfig.editorconfig
+C:\Mail\backend\MailClient.API\obj\Debug\netcoreapp3.1\MailClient.API.AssemblyInfoInputs.cache
+C:\Mail\backend\MailClient.API\obj\Debug\netcoreapp3.1\MailClient.API.AssemblyInfo.cs
+C:\Mail\backend\MailClient.API\obj\Debug\netcoreapp3.1\MailClient.API.csproj.CoreCompileInputs.cache
+C:\Mail\backend\MailClient.API\obj\Debug\netcoreapp3.1\MailClient.API.MvcApplicationPartsAssemblyInfo.cs
+C:\Mail\backend\MailClient.API\obj\Debug\netcoreapp3.1\MailClient.API.MvcApplicationPartsAssemblyInfo.cache
+C:\Mail\backend\MailClient.API\obj\Debug\netcoreapp3.1\MailClient.API.sourcelink.json

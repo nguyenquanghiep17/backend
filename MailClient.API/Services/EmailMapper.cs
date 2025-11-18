@@ -37,7 +37,7 @@ public static class EmailMapper
                 {
                     FileName = part.FileName ?? "unknown",
                     ContentType = part.ContentType.MimeType,
-                    Size = part.Content?.Length ?? 0
+                    Size = 0
                 });
             }
         }

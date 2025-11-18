@@ -1,50 +1,65 @@
-using MailKit;
-using MailKit.Net.Imap;
-using MailKit.Search;
 using MailClient.API.Models;
-using Microsoft.Extensions.Options;
+using MailClient.API.Abstractions;
 
 namespace MailClient.API.Services;
 
 public class MailService : IMailService
 {
-    private readonly MailSettings _settings;
+    private readonly IMailAccountRepository _repository;
+    private readonly IMailClientFactory _mailClientFactory;
 
-    public MailService(IOptions<MailSettings> settings)
+    public MailService(IMailAccountRepository repository, IMailClientFactory mailClientFactory)
     {
-        _settings = settings.Value;
+        _repository = repository;
+        _mailClientFactory = mailClientFactory;
     }
 
-    private MailAccount? GetAccount(string email)
+    private async Task<MailAccount?> GetAccountAsync(string email)
     {
-        return _settings.Accounts.FirstOrDefault(a => a.Email.Equals(email, StringComparison.OrdinalIgnoreCase));
+        var allAccounts = await _repository.GetAllAccountsAsync();
+        var dbAccount = allAccounts.FirstOrDefault(a => 
+            a.Email != null && a.Email.Equals(email, StringComparison.OrdinalIgnoreCase));
+
+        if (dbAccount == null)
+            return null;
+
+        return new MailAccount
+        {
+            Email = dbAccount.Email!,
+            Password = dbAccount.Password ?? string.Empty,
+            ImapServer = dbAccount.ImapServer ?? string.Empty,
+            ImapPort = dbAccount.ImapPort ?? 993,
+            SmtpServer = dbAccount.SmtpServer ?? string.Empty,
+            SmtpPort = dbAccount.SmtpPort ?? 587,
+            UseSsl = dbAccount.UseSsl ?? true
+        };
     }
 
     public async Task<List<EmailMessage>> GetInboxEmailsAsync(string accountEmail)
     {
-        var account = GetAccount(accountEmail);
+        var account = await GetAccountAsync(accountEmail);
         if (account == null)
             throw new Exception($"Account {accountEmail} not found");
 
         var emails = new List<EmailMessage>();
 
-        using var client = new ImapClient();
+        using var client = _mailClientFactory.CreateClient();
         try
         {
             await client.ConnectAsync(account.ImapServer, account.ImapPort, account.UseSsl);
             await client.AuthenticateAsync(account.Email, account.Password);
 
-            var inbox = client.Inbox;
+            var inbox = await client.GetInboxAsync();
             await inbox.OpenAsync(FolderAccess.ReadOnly);
 
             // Lấy 50 email mới nhất
-            var uids = await inbox.SearchAsync(SearchQuery.All);
+            var uids = await inbox.SearchAllAsync();
             var items = uids.TakeLast(50).ToList();
 
             foreach (var uid in items)
             {
                 var message = await inbox.GetMessageAsync(uid);
-                emails.Add(EmailMapper.ToEmailMessage(message, uid.ToString()));
+                emails.Add(message);
             }
 
             await client.DisconnectAsync(true);
@@ -59,37 +74,32 @@ public class MailService : IMailService
 
     public async Task<List<EmailMessage>> GetSentEmailsAsync(string accountEmail)
     {
-        var account = GetAccount(accountEmail);
+        var account = await GetAccountAsync(accountEmail);
         if (account == null)
             throw new Exception($"Account {accountEmail} not found");
 
         var emails = new List<EmailMessage>();
 
-        using var client = new ImapClient();
+        using var client = _mailClientFactory.CreateClient();
         try
         {
             await client.ConnectAsync(account.ImapServer, account.ImapPort, account.UseSsl);
             await client.AuthenticateAsync(account.Email, account.Password);
 
-            // Tìm thư mục Sent
-            var personalNamespaces = client.PersonalNamespaces;
-            var sentFolder = client.GetFolder(SpecialFolder.Sent) ?? 
-                           client.GetFolder("Sent") ?? 
-                           client.GetFolder("[Gmail]/Sent Mail");
-
+            var sentFolder = await client.GetSentFolderAsync();
             if (sentFolder == null)
                 return emails;
 
             await sentFolder.OpenAsync(FolderAccess.ReadOnly);
 
             // Lấy 50 email mới nhất
-            var uids = await sentFolder.SearchAsync(SearchQuery.All);
+            var uids = await sentFolder.SearchAllAsync();
             var items = uids.Take(50).ToList();
 
             foreach (var uid in items)
             {
                 var message = await sentFolder.GetMessageAsync(uid);
-                emails.Add(EmailMapper.ToEmailMessage(message, uid.ToString()));
+                emails.Add(message);
             }
 
             await client.DisconnectAsync(true);
@@ -104,31 +114,26 @@ public class MailService : IMailService
 
     public async Task<EmailMessage?> GetEmailByIdAsync(string accountEmail, string emailId)
     {
-        var account = GetAccount(accountEmail);
+        var account = await GetAccountAsync(accountEmail);
         if (account == null)
             throw new Exception($"Account {accountEmail} not found");
 
-        using var client = new ImapClient();
+        using var client = _mailClientFactory.CreateClient();
         try
         {
             await client.ConnectAsync(account.ImapServer, account.ImapPort, account.UseSsl);
             await client.AuthenticateAsync(account.Email, account.Password);
 
-            var inbox = client.Inbox;
+            var inbox = await client.GetInboxAsync();
             await inbox.OpenAsync(FolderAccess.ReadOnly);
 
-            if (int.TryParse(emailId, out var uid))
-            {
-                var message = await inbox.GetMessageAsync(uid);
-                return EmailMapper.ToEmailMessage(message, emailId);
-            }
+            var message = await inbox.GetMessageAsync(emailId);
+            return message;
         }
         catch (Exception ex)
         {
             throw new Exception($"Error fetching email: {ex.Message}", ex);
         }
-
-        return null;
     }
 
 }
